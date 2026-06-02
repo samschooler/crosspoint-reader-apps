@@ -7,7 +7,8 @@ Our goal is to make the device more useful in your day-to-day life without compr
 
 **Now running on:** ESP32C3-based Xteink [X4](https://www.xteink.com/products/xteink-x4) and [X3](https://www.xteink.com/products/xteink-x3).
 
-![CrossPoint Reader running on Xteink device](./docs/images/apps/homescreen.jpg)
+
+<img src="./docs/images/apps/homescreen.jpg" alt="Weather" width="50%">
 
 ## Features
 
