@@ -21,6 +21,8 @@ class ParsedText {
   bool extraParagraphSpacing;
   bool hyphenationEnabled;
   bool focusReadingEnabled;
+  bool indentApplied = false;
+  bool layoutStarted = false;
 
   void applyParagraphIndent();
   std::vector<size_t> computeLineBreaks(const GfxRenderer& renderer, int fontId, int pageWidth,

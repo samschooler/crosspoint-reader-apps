@@ -34,8 +34,11 @@ class TxtReaderActivity final : public Activity {
   void renderStatusBar() const;
 
   void initializeReader();
+  bool loadIndex();
+  void buildIndex();
+  void saveIndex() const;
   bool loadPageAtOffset(size_t offset, std::vector<std::string>& outLines, size_t& nextOffset);
-  void wrapAndPushHtmlLine(const std::string& line, char marker, EpdFontFamily::Style style, int indent, std::vector<std::string>& outLines);
+  size_t wrapAndPushHtmlLine(const std::string& line, char marker, EpdFontFamily::Style style, int indent, std::vector<std::string>& outLines);
   void saveProgress() const;
   void loadProgress();
 

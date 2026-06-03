@@ -85,6 +85,16 @@ class ChapterHtmlSlimParser {
   FootnoteEntry currentFootnote = {};
   int currentFootnoteLinkTextLen = 0;
   std::vector<std::pair<int, FootnoteEntry>> pendingFootnotes;  // <wordIndex, entry>
+  bool currentTextBlockMarginsApplied = false;
+
+  void applyTextBlockTopMargins() {
+    if (currentTextBlockMarginsApplied || !currentTextBlock) return;
+    currentTextBlockMarginsApplied = true;
+    const BlockStyle& blockStyle = currentTextBlock->getBlockStyle();
+    if (blockStyle.marginTop > 0) currentPageNextY += blockStyle.marginTop;
+    if (blockStyle.paddingTop > 0) currentPageNextY += blockStyle.paddingTop;
+  }
+
   int wordsExtractedInBlock = 0;
 
   void updateEffectiveInlineStyle();
