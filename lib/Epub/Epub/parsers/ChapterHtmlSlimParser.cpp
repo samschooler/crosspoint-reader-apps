@@ -22,6 +22,13 @@
 constexpr size_t MIN_SIZE_FOR_POPUP = 10 * 1024;  // 10KB
 constexpr size_t PARSE_BUFFER_SIZE = 1024;
 
+// Hard cap on the number of anchor IDs recorded per chapter. Legitimate navigation
+// anchors (TOC entries, footnotes, cross-references) rarely exceed a few hundred per
+// chapter. A runaway count usually means a converter injected machine-generated IDs on
+// every text fragment (e.g. Kobo KePub spans). The cap prevents unbounded heap growth
+// on resource-constrained devices (~380KB heap). TOC anchors bypass this cap.
+constexpr size_t MAX_ANCHORS_PER_CHAPTER = 1024;
+
 constexpr const char* HEADER_TAGS[] = {"h1", "h2", "h3", "h4", "h5", "h6"};
 constexpr const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote"};
 constexpr const char* BOLD_TAGS[] = {"b", "strong"};
@@ -49,6 +56,14 @@ const char* getAttribute(const XML_Char** atts, const char* attrName) {
   return nullptr;
 }
 
+// Returns true if the HTML element is a purely inline, non-navigable wrapper.
+// IDs on these elements are never meaningful navigation targets in epub content.
+// Reading-system converters (Kobo KePub, Calibre, etc.) frequently inject thousands
+// of such IDs for progress tracking or internal bookkeeping, and recording each one
+// as a navigation anchor exhausts the heap on memory-constrained devices.
+// Block-level, sectioning, and structural elements are always considered navigable.
+bool isNonNavigableInlineElement(const char* name) { return strcmp(name, "span") == 0; }
+
 bool isInternalEpubLink(const char* href) {
   if (!href || href[0] == '\0') return false;
   if (strncmp(href, "http://", 7) == 0 || strncmp(href, "https://", 8) == 0) return false;
@@ -67,6 +82,13 @@ bool isTableStructuralTag(const char* name) {
   return strcmp(name, "table") == 0 || strcmp(name, "tr") == 0 || strcmp(name, "td") == 0 || strcmp(name, "th") == 0;
 }
 
+void ChapterHtmlSlimParser::applyDirectionToEntry(StyleStackEntry& entry, const CssStyle& css) {
+  if (css.hasDirection()) {
+    entry.hasDirection = true;
+    entry.direction = css.direction;
+  }
+}
+
 // Update effective bold/italic/underline based on block style and inline style stack
 void ChapterHtmlSlimParser::updateEffectiveInlineStyle() {
   // Start with block-level styles
@@ -74,6 +96,10 @@ void ChapterHtmlSlimParser::updateEffectiveInlineStyle() {
   effectiveItalic = currentCssStyle.hasFontStyle() && currentCssStyle.fontStyle == CssFontStyle::Italic;
   effectiveUnderline =
       currentCssStyle.hasTextDecoration() && currentCssStyle.textDecoration == CssTextDecoration::Underline;
+  effectiveDirectionDefined = currentCssStyle.hasDirection();
+  effectiveDirection = currentCssStyle.direction;
+  effectiveSup = false;
+  effectiveSub = false;
 
   // Apply inline style stack in order
   for (const auto& entry : inlineStyleStack) {
@@ -86,7 +112,51 @@ void ChapterHtmlSlimParser::updateEffectiveInlineStyle() {
     if (entry.hasUnderline) {
       effectiveUnderline = entry.underline;
     }
+    if (entry.hasDirection) {
+      effectiveDirectionDefined = true;
+      effectiveDirection = entry.direction;
+    }
+    if (entry.hasSup) {
+      effectiveSup = entry.sup;
+      if (entry.sup) effectiveSub = false;
+    }
+    if (entry.hasSub) {
+      effectiveSub = entry.sub;
+      if (entry.sub) effectiveSup = false;
+    }
   }
+
+  // Keep inherited direction in the active empty text block so upcoming block starts
+  // can inherit from non-block ancestors such as <html dir="rtl"> / <body dir="rtl">.
+  if (currentTextBlock && currentTextBlock->isEmpty()) {
+    auto& style = currentTextBlock->getBlockStyle();
+    if (effectiveDirectionDefined) {
+      style.directionDefined = true;
+      style.isRtl = (effectiveDirection == CssTextDirection::Rtl);
+    } else {
+      style.directionDefined = false;
+      style.isRtl = false;
+    }
+  }
+}
+
+void ChapterHtmlSlimParser::flushPendingAnchor() {
+  if (pendingAnchorId.empty()) return;
+
+  // If the pending anchor is a TOC chapter boundary, force a page break after the previous
+  // block is flushed so the chapter starts on a fresh page.
+  if (std::find(tocAnchors.begin(), tocAnchors.end(), pendingAnchorId) != tocAnchors.end()) {
+    if (currentPage && !currentPage->elements.empty()) {
+      completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
+      completedPageCount++;
+      currentPage.reset(new Page());
+      currentPageNextY = 0;
+    }
+  }
+
+  // Record deferred anchor after previous block is flushed (and any TOC page break)
+  anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
+  pendingAnchorId.clear();
 }
 
 // flush the contents of partWordBuffer to currentTextBlock
@@ -106,6 +176,11 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
   }
   if (isUnderline) {
     fontStyle = static_cast<EpdFontFamily::Style>(fontStyle | EpdFontFamily::UNDERLINE);
+  }
+  if (effectiveSup) {
+    fontStyle = static_cast<EpdFontFamily::Style>(fontStyle | EpdFontFamily::SUP);
+  } else if (effectiveSub) {
+    fontStyle = static_cast<EpdFontFamily::Style>(fontStyle | EpdFontFamily::SUB);
   }
 
   // flush the buffer
@@ -130,20 +205,15 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
       const auto style = currentTextBlock->getBlockStyle();
       currentTextBlock->setBlockStyle(style.getCombinedBlockStyle(blockStyle, BlockStyle::CombineAxis::Vertical));
 
-      if (!pendingAnchorId.empty()) {
-        anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
-        pendingAnchorId.clear();
-      }
+      flushPendingAnchor();
       return;
     }
 
     makePages();
   }
-  // Record deferred anchor after previous block is flushed
-  if (!pendingAnchorId.empty()) {
-    anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
-    pendingAnchorId.clear();
-  }
+  // If the pending anchor is a TOC chapter boundary, force a page break after the previous
+  // block is flushed so the chapter starts on a fresh page.
+  flushPendingAnchor();
   currentTextBlock.reset(new ParsedText(extraParagraphSpacing, hyphenationEnabled, focusReadingEnabled, blockStyle));
   wordsExtractedInBlock = 0;
 }
@@ -226,9 +296,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     self->xpathListItemIndex++;
   }
 
-  // Extract class, style, and id attributes
+  // Extract class, style, id, and dir attributes for CSS/RTL processing
   std::string classAttr;
   std::string styleAttr;
+  std::string dirAttr;
   if (atts != nullptr) {
     for (int i = 0; atts[i]; i += 2) {
       if (strcmp(atts[i], "class") == 0) {
@@ -236,8 +307,29 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       } else if (strcmp(atts[i], "style") == 0) {
         styleAttr = atts[i + 1];
       } else if (strcmp(atts[i], "id") == 0) {
-        // Defer recording until startNewTextBlock, after previous block is flushed to pages
-        self->pendingAnchorId = atts[i + 1];
+        // Defer both anchor recording and TOC page breaks until startNewTextBlock,
+        // after the previous block is flushed to pages via makePages().
+        //
+        // Skip IDs on non-navigable inline elements (e.g. <span>): these are never
+        // link targets in epub content, but reading-system converters can inject tens
+        // of thousands of them per chapter, exhausting the heap. TOC anchors are
+        // always recorded regardless of element type, since they drive page breaks.
+        const char* idValue = atts[i + 1];
+        const bool isTocAnchor =
+            std::find(self->tocAnchors.begin(), self->tocAnchors.end(), idValue) != self->tocAnchors.end();
+        if (isTocAnchor || (!isNonNavigableInlineElement(name) && self->anchorData.size() < MAX_ANCHORS_PER_CHAPTER)) {
+          // Flush a displaced anchor before overwriting. Consecutive non-block elements
+          // (e.g. <aside id="fn1">text</aside><aside id="fn2">) with no intervening block
+          // never trigger startNewTextBlock, so fn1 gets silently overwritten. That leaves
+          // fn1 missing from the anchor map -> getPageForAnchor returns nullopt -> reader
+          // lands at page 0 (section start) instead of the footnote.
+          if (!self->pendingAnchorId.empty()) {
+            self->flushPendingAnchor();
+          }
+          self->pendingAnchorId = idValue;
+        }
+      } else if (strcmp(atts[i], "dir") == 0) {
+        dirAttr = atts[i + 1];
       }
     }
   }
@@ -255,6 +347,24 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       CssStyle inlineStyle = CssParser::parseInlineStyle(styleAttr);
       cssStyle.applyOver(inlineStyle);
     }
+  }
+
+  // HTML dir attribute overrides CSS direction (case-insensitive per HTML spec)
+  if (!dirAttr.empty()) {
+    if (strcasecmp(dirAttr.c_str(), "rtl") == 0) {
+      cssStyle.direction = CssTextDirection::Rtl;
+      cssStyle.defined.direction = 1;
+    } else if (strcasecmp(dirAttr.c_str(), "ltr") == 0) {
+      cssStyle.direction = CssTextDirection::Ltr;
+      cssStyle.defined.direction = 1;
+    }
+  }
+
+  // Direction is inherited in HTML/CSS. If this element does not define one, carry
+  // the currently active inherited direction into its computed style.
+  if (!cssStyle.hasDirection() && self->effectiveDirectionDefined) {
+    cssStyle.direction = self->effectiveDirection;
+    cssStyle.defined.direction = 1;
   }
 
   // Skip elements with display:none before all fast paths (tables, links, etc.).
@@ -369,7 +479,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
 
         {
           // Resolve the image path relative to the HTML file
-          std::string resolvedPath = FsHelpers::normalisePath(self->contentBase + src);
+          std::string resolvedPath = FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(self->contentBase + src));
 
           if (ImageDecoderFactory::isFormatSupported(resolvedPath)) {
             // Create a unique filename for the cached image
@@ -657,6 +767,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       entry.depth = self->depth;
       entry.hasUnderline = true;
       entry.underline = true;
+      applyDirectionToEntry(entry, cssStyle);
       self->inlineStyleStack.push_back(entry);
       self->updateEffectiveInlineStyle();
 
@@ -741,6 +852,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       entry.hasItalic = true;
       entry.italic = cssStyle.fontStyle == CssFontStyle::Italic;
     }
+    applyDirectionToEntry(entry, cssStyle);
     self->inlineStyleStack.push_back(entry);
     self->updateEffectiveInlineStyle();
   } else if (matches(name, BOLD_TAGS, std::size(BOLD_TAGS))) {
@@ -763,6 +875,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       entry.hasUnderline = true;
       entry.underline = cssStyle.textDecoration == CssTextDecoration::Underline;
     }
+    applyDirectionToEntry(entry, cssStyle);
     self->inlineStyleStack.push_back(entry);
     self->updateEffectiveInlineStyle();
   } else if (matches(name, ITALIC_TAGS, std::size(ITALIC_TAGS))) {
@@ -785,11 +898,29 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       entry.hasUnderline = true;
       entry.underline = cssStyle.textDecoration == CssTextDecoration::Underline;
     }
+    applyDirectionToEntry(entry, cssStyle);
+    self->inlineStyleStack.push_back(entry);
+    self->updateEffectiveInlineStyle();
+  } else if (strcmp(name, "sup") == 0 || strcmp(name, "sub") == 0) {
+    if (self->partWordBufferIndex > 0) {
+      self->flushPartWordBuffer();
+      self->nextWordContinues = true;
+    }
+    StyleStackEntry entry;
+    entry.depth = self->depth;
+    if (strcmp(name, "sup") == 0) {
+      entry.hasSup = true;
+      entry.sup = true;
+    } else {
+      entry.hasSub = true;
+      entry.sub = true;
+    }
     self->inlineStyleStack.push_back(entry);
     self->updateEffectiveInlineStyle();
   } else if (strcmp(name, "span") == 0 || !isHeaderOrBlock(name)) {
     // Handle span and other inline elements for CSS styling
-    if (cssStyle.hasFontWeight() || cssStyle.hasFontStyle() || cssStyle.hasTextDecoration()) {
+    if (cssStyle.hasFontWeight() || cssStyle.hasFontStyle() || cssStyle.hasTextDecoration() ||
+        cssStyle.hasDirection() || cssStyle.hasVerticalAlign()) {
       // Flush buffer before style change so preceding text gets current style
       if (self->partWordBufferIndex > 0) {
         self->flushPartWordBuffer();
@@ -808,6 +939,16 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       if (cssStyle.hasTextDecoration()) {
         entry.hasUnderline = true;
         entry.underline = cssStyle.textDecoration == CssTextDecoration::Underline;
+      }
+      applyDirectionToEntry(entry, cssStyle);
+      if (cssStyle.hasVerticalAlign()) {
+        if (cssStyle.verticalAlign == CssVerticalAlign::Super) {
+          entry.hasSup = true;
+          entry.sup = true;
+        } else if (cssStyle.verticalAlign == CssVerticalAlign::Sub) {
+          entry.hasSub = true;
+          entry.sub = true;
+        }
       }
       self->inlineStyleStack.push_back(entry);
       self->updateEffectiveInlineStyle();

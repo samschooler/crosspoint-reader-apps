@@ -1,6 +1,6 @@
 #include "TxtReaderActivity.h"
 
-#include <algorithm>
+#include <BidiUtils.h>
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
@@ -9,9 +9,12 @@
 #include <Serialization.h>
 #include <Utf8.h>
 
+#include <algorithm>
+
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
+#include "ProgressFile.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
@@ -773,7 +776,6 @@ void TxtReaderActivity::render(RenderLock&&) {
 
 void TxtReaderActivity::renderPage() {
   const int lineHeight = renderer.getLineHeight(cachedFontId);
-  const int contentWidth = viewportWidth;
 
   // Render text lines with alignment
   auto renderLines = [&]() {
@@ -823,8 +825,16 @@ void TxtReaderActivity::renderPage() {
       } else if (!line.empty()) {
         int x = cachedOrientedMarginLeft + indent;
 
+        // Per-line RTL detection (bidi): flip left/justified alignment to right for RTL lines.
+        const bool lineIsRtl = BidiUtils::startsWithRtl(line.c_str(), BidiUtils::RTL_PARAGRAPH_PROBE_DEPTH);
+        uint8_t effectiveAlignment = cachedParagraphAlignment;
+        if (lineIsRtl && (effectiveAlignment == CrossPointSettings::LEFT_ALIGN ||
+                          effectiveAlignment == CrossPointSettings::JUSTIFIED)) {
+          effectiveAlignment = CrossPointSettings::RIGHT_ALIGN;
+        }
+
         // Apply text alignment
-        switch (cachedParagraphAlignment) {
+        switch (effectiveAlignment) {
           case CrossPointSettings::LEFT_ALIGN:
           default:
             // x already set
@@ -971,16 +981,17 @@ void TxtReaderActivity::saveIndex() const {
 }
 
 void TxtReaderActivity::saveProgress() const {
-  HalFile f;
-  if (Storage.openFileForWrite("TRS", txt->getCachePath() + "/progress.bin", f)) {
-    size_t offset = pageOffsets[currentPage];
-    uint8_t data[4];
-    data[0] = offset & 0xFF;
-    data[1] = (offset >> 8) & 0xFF;
-    data[2] = (offset >> 16) & 0xFF;
-    data[3] = (offset >> 24) & 0xFF;
-    f.write(data, 4);
-    f.close();
+  // Store the byte offset of the current page (robust to re-pagination); loadProgress
+  // maps it back to a page index. Use ProgressFile's crash-safe atomic write so an
+  // interrupted save can never leave progress.bin torn (upstream issue #2275).
+  size_t offset = pageOffsets[currentPage];
+  uint8_t data[4];
+  data[0] = offset & 0xFF;
+  data[1] = (offset >> 8) & 0xFF;
+  data[2] = (offset >> 16) & 0xFF;
+  data[3] = (offset >> 24) & 0xFF;
+  if (!ProgressFile::writeAtomic(txt->getCachePath(), data, sizeof(data))) {
+    LOG_ERR("TRS", "Failed to save progress: offset %u", static_cast<unsigned>(offset));
   }
 }
 
